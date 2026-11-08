@@ -886,9 +886,12 @@ class Capture:
                 return await self.client._call(sender, request)
             except (RPCError, ValueError, ConnectionError,
                     asyncio.TimeoutError) as e:
-                if self._migrate_dc(e) is None:
+                dc = self._migrate_dc(e)
+                # Re-exporting on every error floods Telegram's auth-export
+                # API, which terminates the whole session for abuse. Only
+                # follow a migration to a *different* DC.
+                if dc is None or dc == self._call_dc:
                     raise
-                # The call moved again (or the exported sender went stale).
                 getattr(self.client, "_borrowed_senders", {}).pop(
                     self._call_dc, None)
                 self._call_dc = None
