@@ -12,6 +12,11 @@
 
 x-capture: &capture
   image: tgstream:fork
+  # CentOS 7's 3.10 kernel + docker's default seccomp profile breaks modern
+  # musl/sqlite (disk I/O error on session creation). Unconfined until the
+  # host boots a newer kernel.
+  security_opt:
+    - seccomp=unconfined
   build:
     context: .
     dockerfile: Dockerfile
