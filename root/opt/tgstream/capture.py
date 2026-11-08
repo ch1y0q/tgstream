@@ -732,6 +732,11 @@ class Capture:
     def __init__(self):
         self.client = None
         self.entity = None
+        # Group-call streaming requests must run on the DC the call lives
+        # on; Telethon has no CALL_MIGRATE handling, so we keep an exported
+        # auth client per DC (populated on first migrate error).
+        self._dc_clients = {}
+        self._call_dc = None
 
     async def qr_login(self):
         import base64
@@ -855,6 +860,54 @@ class Capture:
             cands += [types.PeerChannel(n), int(f"-100{n}")]
         return cands
 
+    @staticmethod
+    def _migrate_dc(exc):
+        m = re.search(r"(?:CALL|PHONE|NETWORK)_MIGRATE_(\d+)", str(exc))
+        return int(m.group(1)) if m else None
+
+    async def _dc_client(self, dc_id):
+        """Build (and cache) a client authorized on dc_id for the live call."""
+        cached = self._dc_clients.get(dc_id)
+        if cached is not None:
+            return cached
+        dc = await self.client._get_dc(dc_id)
+        session = self.client.session.clone()
+        session.set_dc(dc.id, dc.ip_address, dc.port)
+        session.auth_key = None  # the main dc's key is meaningless here
+        client = TelegramClient(session, CFG["api_id"], CFG["api_hash"])
+        await asyncio.wait_for(client.connect(), 30)
+        exp = await self.client(
+            functions.auth.ExportAuthorizationRequest(dc_id))
+        await client(functions.auth.ImportAuthorizationRequest(
+            id=exp.id, bytes=exp.bytes))
+        self._dc_clients[dc_id] = client
+        log(f"group call served from DC {dc_id}, auth exported there")
+        return client
+
+    async def call_invoke(self, request):
+        """Invoke a call-bound request, migrating DCs when told to."""
+        if self._call_dc is not None:
+            try:
+                client = await self._dc_client(self._call_dc)
+                return await client(request)
+            except (RPCError, ValueError, ConnectionError,
+                    asyncio.TimeoutError) as e:
+                if self._migrate_dc(e) is None:
+                    raise
+                # The call moved again (or the aux client went stale).
+                self._dc_clients.pop(self._call_dc, None)
+                self._call_dc = None
+        try:
+            return await self.client(request)
+        except RPCError as e:
+            dc = self._migrate_dc(e)
+            if dc is None:
+                raise
+            client = await self._dc_client(dc)
+            res = await client(request)
+            self._call_dc = dc
+            return res
+
     async def live_call(self):
         # Same hard cap as fetch(): a hanging request here silently freezes
         # detection (state stuck "idle", no error, healthcheck green).
@@ -866,7 +919,7 @@ class Capture:
     async def join(self, call):
         params = json.dumps({"fingerprints": [], "pwd": "", "ssrc": JOIN_SSRC,
                              "ssrc-groups": [], "ufrag": ""})
-        await self.client(functions.phone.JoinGroupCallRequest(
+        await self.call_invoke(functions.phone.JoinGroupCallRequest(
             call=call, join_as=types.InputPeerSelf(), muted=True,
             video_stopped=True, params=types.DataJSON(data=params)))
 
@@ -916,7 +969,7 @@ class Capture:
             await asyncio.sleep(15)
             call = get_call()
             try:
-                r = await self.client(functions.phone.CheckGroupCallRequest(
+                r = await self.call_invoke(functions.phone.CheckGroupCallRequest(
                     call=call, sources=[JOIN_SSRC]))
                 if JOIN_SSRC not in r:
                     log("keepalive: ssrc gone, re-joining")
@@ -951,7 +1004,7 @@ class Capture:
             slow_errs = 0
             while not ended["v"]:
                 try:
-                    ch = await self.client(
+                    ch = await self.call_invoke(
                         functions.phone.GetGroupCallStreamChannelsRequest(
                             call=state["call"]))
                 except (RPCError, ValueError, ConnectionError,
