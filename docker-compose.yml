@@ -33,6 +33,10 @@ services:
       - API_HASH=${API_HASH}
       - PUBLIC_HOST=${PUBLIC_HOST}
       - PUBLIC_HTTP_PORT=8410     # must match the ports: mapping below
+      - UPLOAD_CHAT=${UPLOAD_CHAT:-}
+      - UPLOAD_CHUNK_MIB=${UPLOAD_CHUNK_MIB:-1900}
+      - UPLOAD_DELETE_AFTER=${UPLOAD_DELETE_AFTER:-true}
+      - UPLOAD_ENABLED=${UPLOAD_ENABLED:-true}
     volumes:
       - ${APPDATA_DIR}/state/main:/state
       - ${LIBRARY_DIR}:/library

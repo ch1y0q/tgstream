@@ -27,6 +27,7 @@ import av
 from av.bitstream import BitStreamFilterContext
 from telethon import TelegramClient, functions, types
 from telethon.errors import RPCError, SessionPasswordNeededError
+from uploader import attach as attach_uploader, schedule_upload
 
 
 def env(name, default=None, required=False):
@@ -410,6 +411,7 @@ class Recorder:
                 check=True)
             os.replace(tmp, out)
             log(f"Harvest complete: {out}")
+            schedule_upload(out)
         except Exception as exc:  # noqa: BLE001
             STATE.set(error=f"harvest failed: {exc}")
         finally:
@@ -1216,6 +1218,7 @@ class Capture:
         await self.client.connect()
         await self.qr_login()
         self.entity = await self.resolve_peer()
+        attach_uploader(self.client)
         await self.fetch_logo()
 
         stop_slate = threading.Event()
