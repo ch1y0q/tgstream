@@ -884,9 +884,12 @@ class Capture:
         if self._call_dc is not None:
             for attempt in range(2):
                 try:
-                    sender = await self.client._borrow_exported_sender(
-                        self._call_dc)
-                    return await self.client._call(sender, request)
+                    # Bounded: a hanging reconnect on a dead exported sender
+                    # holds the borrow lock and wedges the whole pipeline.
+                    sender = await asyncio.wait_for(
+                        self.client._borrow_exported_sender(self._call_dc), 30)
+                    return await asyncio.wait_for(
+                        self.client._call(sender, request), 35)
                 except (RPCError, ValueError, ConnectionError,
                         asyncio.TimeoutError) as e:
                     dc = self._migrate_dc(e)
@@ -899,8 +902,11 @@ class Capture:
                             self._call_dc, None)
                         self._call_dc = None
                         break
-                    if (attempt == 0 and dc is None and isinstance(
-                            e, _tg_errors.AuthKeyUnregisteredError)):
+                    if attempt == 0 and dc is None and isinstance(
+                            e, (_tg_errors.AuthKeyUnregisteredError,
+                                ConnectionError)):
+                        # Dead or disconnected exported sender: drop it so
+                        # the retry re-exports a fresh auth (once).
                         getattr(self.client, "_borrowed_senders", {}).pop(
                             self._call_dc, None)
                         continue
