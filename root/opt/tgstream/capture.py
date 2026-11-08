@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import av
 from av.bitstream import BitStreamFilterContext
 from telethon import TelegramClient, functions, types
+from telethon import errors as _tg_errors
 from telethon.errors import RPCError, SessionPasswordNeededError
 from uploader import attach as attach_uploader, schedule_upload
 
@@ -881,21 +882,29 @@ class Capture:
         InvokeWithLayer init), which satisfies both.
         """
         if self._call_dc is not None:
-            try:
-                sender = await self.client._borrow_exported_sender(
-                    self._call_dc)
-                return await self.client._call(sender, request)
-            except (RPCError, ValueError, ConnectionError,
-                    asyncio.TimeoutError) as e:
-                dc = self._migrate_dc(e)
-                # Re-exporting on every error floods Telegram's auth-export
-                # API, which terminates the whole session for abuse. Only
-                # follow a migration to a *different* DC.
-                if dc is None or dc == self._call_dc:
+            for attempt in range(2):
+                try:
+                    sender = await self.client._borrow_exported_sender(
+                        self._call_dc)
+                    return await self.client._call(sender, request)
+                except (RPCError, ValueError, ConnectionError,
+                        asyncio.TimeoutError) as e:
+                    dc = self._migrate_dc(e)
+                    # Re-exporting on every error floods Telegram's
+                    # auth-export API, which terminates the whole session
+                    # for abuse. Only follow a migration to a *different*
+                    # DC, and re-export exactly once for a dead sender.
+                    if dc is not None and dc != self._call_dc:
+                        getattr(self.client, "_borrowed_senders", {}).pop(
+                            self._call_dc, None)
+                        self._call_dc = None
+                        break
+                    if (attempt == 0 and dc is None and isinstance(
+                            e, _tg_errors.AuthKeyUnregisteredError)):
+                        getattr(self.client, "_borrowed_senders", {}).pop(
+                            self._call_dc, None)
+                        continue
                     raise
-                getattr(self.client, "_borrowed_senders", {}).pop(
-                    self._call_dc, None)
-                self._call_dc = None
         try:
             return await self.client(request)
         except RPCError as e:
@@ -1016,7 +1025,9 @@ class Capture:
                     if chanerrs <= 2 or chanerrs % 30 == 0:
                         log(f"NO-MEDIA: stream channels query failed "
                             f"(x{chanerrs}): {e!r}")
-                    await asyncio.sleep(1)
+                    # Back off like a viewer, not a ripper: Telegram kills
+                    # sessions that hammer call/stream APIs.
+                    await asyncio.sleep(min(60, 2 ** min(chanerrs, 6)))
                     try:
                         c = await self.live_call()
                     except (RPCError, ValueError, ConnectionError,
@@ -1252,7 +1263,9 @@ class Capture:
                             await asyncio.sleep(1)
                             refetch = True
                         else:
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(
+                                min(60, 2 ** min(errs - 4, 6))
+                                if errs > 4 else 0.5)
                 cancel_pending()
             ended["v"] = True
             await queue.put(None)
@@ -1276,9 +1289,16 @@ class Capture:
 
     async def run(self):
         os.makedirs(CFG["state_dir"], exist_ok=True)
+        proxy = None
+        if os.environ.get("TG_PROXY_HOST"):
+            proxy = {
+                "scheme": os.environ.get("TG_PROXY_SCHEME", "socks5"),
+                "hostname": os.environ["TG_PROXY_HOST"],
+                "port": int(os.environ.get("TG_PROXY_PORT", "1080")),
+            }
         self.client = TelegramClient(
             os.path.join(CFG["state_dir"], "session"),
-            CFG["api_id"], CFG["api_hash"])
+            CFG["api_id"], CFG["api_hash"], proxy=proxy)
         await self.client.connect()
         await self.qr_login()
         self.entity = await self.resolve_peer()
