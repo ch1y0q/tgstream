@@ -733,9 +733,9 @@ class Capture:
         self.client = None
         self.entity = None
         # Group-call streaming requests must run on the DC the call lives
-        # on; Telethon has no CALL_MIGRATE handling, so we keep an exported
-        # auth client per DC (populated on first migrate error).
-        self._dc_clients = {}
+        # on with one consistent auth (join state is per auth); Telethon
+        # has no CALL_MIGRATE handling, so call_invoke() re-routes via an
+        # exported sender (populated on first migrate error).
         self._call_dc = None
 
     async def qr_login(self):
@@ -862,40 +862,35 @@ class Capture:
 
     @staticmethod
     def _migrate_dc(exc):
-        m = re.search(r"(?:CALL|PHONE|NETWORK)_MIGRATE_(\d+)", str(exc))
-        return int(m.group(1)) if m else None
-
-    async def _dc_client(self, dc_id):
-        """Build (and cache) a client authorized on dc_id for the live call."""
-        cached = self._dc_clients.get(dc_id)
-        if cached is not None:
-            return cached
-        dc = await self.client._get_dc(dc_id)
-        session = self.client.session.clone()
-        session.set_dc(dc.id, dc.ip_address, dc.port)
-        session.auth_key = None  # the main dc's key is meaningless here
-        client = TelegramClient(session, CFG["api_id"], CFG["api_hash"])
-        await asyncio.wait_for(client.connect(), 30)
-        exp = await self.client(
-            functions.auth.ExportAuthorizationRequest(dc_id))
-        await client(functions.auth.ImportAuthorizationRequest(
-            id=exp.id, bytes=exp.bytes))
-        self._dc_clients[dc_id] = client
-        log(f"group call served from DC {dc_id}, auth exported there")
-        return client
+        # FILE_MIGRATE: chunk fetches name the file's DC directly.
+        for text in (str(exc), getattr(exc, "message", "")):
+            m = re.search(r"(?:CALL|PHONE|NETWORK|FILE)_MIGRATE_(\d+)", text)
+            if m:
+                return int(m.group(1))
+        return None
 
     async def call_invoke(self, request):
-        """Invoke a call-bound request, migrating DCs when told to."""
+        """Invoke a call-bound request, migrating DCs when told to.
+
+        Group-call traffic (join/keepalive/stream channels/chunk GetFile)
+        must run on the DC the call lives on AND with one consistent
+        authorization - join state is per auth, so a fetch from a
+        different exported auth fails with JOIN_MISSING. Telethon's
+        _borrow_exported_sender caches one sender per DC (with proper
+        InvokeWithLayer init), which satisfies both.
+        """
         if self._call_dc is not None:
             try:
-                client = await self._dc_client(self._call_dc)
-                return await client(request)
+                sender = await self.client._borrow_exported_sender(
+                    self._call_dc)
+                return await self.client._call(sender, request)
             except (RPCError, ValueError, ConnectionError,
                     asyncio.TimeoutError) as e:
                 if self._migrate_dc(e) is None:
                     raise
-                # The call moved again (or the aux client went stale).
-                self._dc_clients.pop(self._call_dc, None)
+                # The call moved again (or the exported sender went stale).
+                getattr(self.client, "_borrowed_senders", {}).pop(
+                    self._call_dc, None)
                 self._call_dc = None
         try:
             return await self.client(request)
@@ -903,9 +898,10 @@ class Capture:
             dc = self._migrate_dc(e)
             if dc is None:
                 raise
-            client = await self._dc_client(dc)
-            res = await client(request)
+            sender = await self.client._borrow_exported_sender(dc)
+            res = await self.client._call(sender, request)
             self._call_dc = dc
+            log(f"group call traffic migrated to DC {dc}")
             return res
 
     async def live_call(self):
