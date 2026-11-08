@@ -11,7 +11,7 @@
 # Host paths and PUBLIC_HOST come from .env (see .env.example).
 
 x-capture: &capture
-  image: ghcr.io/azinchen/tgstream:latest
+  image: tgstream:fork
   build:
     context: .
     dockerfile: Dockerfile
@@ -46,7 +46,7 @@ services:
       - "8410:8409"
 
   guide:
-    image: ghcr.io/azinchen/tgstream-guide:latest
+    image: tgstream-guide:fork
     build:
       context: ./guide
       dockerfile: Dockerfile
