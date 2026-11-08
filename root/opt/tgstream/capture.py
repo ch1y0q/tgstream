@@ -737,6 +737,7 @@ class Capture:
         # has no CALL_MIGRATE handling, so call_invoke() re-routes via an
         # exported sender (populated on first migrate error).
         self._call_dc = None
+        self._joined_dc = None
 
     async def qr_login(self):
         import base64
@@ -1031,6 +1032,17 @@ class Capture:
                         pass
                     continue
                 chanerrs = 0
+                # Join state is per auth: the join we did on the main client
+                # registered the ssrc under the main DC's auth, but chunks
+                # are fetched with the exported DC auth. Re-join there once.
+                if self._call_dc is not None and self._joined_dc != self._call_dc:
+                    try:
+                        await self.join(state["call"])
+                        self._joined_dc = self._call_dc
+                        log(f"re-joined on the call's DC {self._call_dc}")
+                    except (RPCError, ValueError, ConnectionError,
+                            asyncio.TimeoutError) as e:
+                        log(f"dc re-join failed: {e!r}")
                 if not ch.channels:
                     # Call exists but serves no stream channels (broadcaster
                     # not sending, or a WebRTC video chat). Silent before -
